@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-# Copyright (C) 2024 Christian Ospelkaus
+# Copyright (C) 2023- Christian Ospelkaus
 # This file is part of modbus_logger <https://github.com/cospelka/modbus_logger>.
 #
 # modbus_logger is free software: you can redistribute it and/or modify
