@@ -1,0 +1,12 @@
+[Unit]
+Description=Modbus Logger
+Requires=network.target
+After=network.target
+
+[Service]
+PIDFile=/var/run/modbus_logger.pid
+Type=simple
+ExecStart=/usr/local/sbin/modbus_logger.py
+
+[Install]
+WantedBy=multi-user.target

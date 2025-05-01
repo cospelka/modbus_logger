@@ -123,7 +123,7 @@ dl = { "uint32": 2,
 # Influx client starten
 for db,dbvals in influxdbs.items():
   try:
-    influxdbs[db]["influxconn"] = InfluxDBClient(dbvals["host"], dbvals["port"], database=dbvals["dbname"])
+    influxdbs[db]["influxconn"] = InfluxDBClient(**dbvals)
   except Exception as e:
     print(e)
     print(f'Could not setup InfluxDB client {db}. Bye.')
@@ -216,7 +216,7 @@ while True:
     perfstr=''
 
     # In diese Dateien wandert die Statusausgabe für Icinga. Wird dann von einem Icinga plugin ausgelesen. 
-    statusfilename=f'/usr/local/var/lib/modbus_logger/{mdrun}.txt'
+    statusfilename=f'/var/local/lib/modbus_logger/{mdrun}.txt'
     if debug:
       statusfilename=f'/usr/local/var/lib/modbus_logger/{mdrun}_debug.txt'
     statusfilenametmp=statusfilename + '.tmp'
