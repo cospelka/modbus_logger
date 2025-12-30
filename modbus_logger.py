@@ -16,9 +16,7 @@
 # along with modbus_logger.  If not, see <http://www.gnu.org/licenses/>.
 
 from pymodbus.client import ModbusTcpClient,ModbusUdpClient,ModbusSerialClient
-from pymodbus.payload import BinaryPayloadDecoder
 from pymodbus.constants import Endian
-from pymodbus.framer.rtu_framer import ModbusRtuFramer
 from influxdb import InfluxDBClient
 import math 
 import time 
@@ -27,11 +25,8 @@ import sys
 import configparser
 import json
 import os
-
-# String (b vs. l) für Byte bzw Word order in Konstante für pymodbus übersetzen
-bo = { "b": Endian.Big,
-       "l": Endian.Little
-     }
+import argparse
+import fcntl
 
 # Parse ini file
 # This dict will hold the modbus device classes
@@ -57,6 +52,8 @@ for section in iniparser.sections():
         print(e)
         print(f'JSON parse error in [{sectiontype} {name}], key {key}. Bye.')
         sys.exit(1)
+      if mdc[name][key]["Typ"] == 1:
+        mdc[name][key]["Dt"] = "bool"
   if sectiontype == "modbus_device":
     md[name]={}
     for key in iniparser[section]:
@@ -97,7 +94,6 @@ for name in mc:
 for name in md:  
   md[name]["endian_byte"] = md[name].get("modbus_endian_byte","b")
   md[name]["endian_word"] = md[name].get("modbus_endian_word","b")
-  md[name]["slaveid"]     = md[name].get("slaveid",0)
 
 for name in mdc:  
   for var in mdc[name]:
@@ -119,6 +115,23 @@ dl = { "uint32": 2,
        "int8":   8,
        "bool":   1
      }
+
+def acquire_lock(label="default"):
+
+    # Create empty lock file if it does not exist yet
+    lock_file = "/root/.instance_" + label + ".lock"
+    if not os.path.isfile(lock_file):
+        with open(lock_file,"w") as f:
+            f.write("")
+
+    lock_file_pointer = os.open(lock_file, os.O_WRONLY)
+
+    try:
+        fcntl.lockf(lock_file_pointer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return(lock_file_pointer)
+    except IOError:
+        os.close(lock_file_pointer)
+        return(None)
 
 # Influx client starten
 for db,dbvals in influxdbs.items():
@@ -149,8 +162,7 @@ for name in mc:
       sys.exit(1)
   elif mc[name]["type"] == "r":
     try:
-      mc[name]["conn"] = ModbusSerialClient(method='rtu',
-                                            port     = mc[name]["serialdevice"],
+      mc[name]["conn"] = ModbusSerialClient(port     = mc[name]["serialdevice"],
                                             baudrate = mc[name]["baudrate"],
                                             bytesize = mc[name]["bytesize"],
                                             parity   = mc[name]["parity"],
@@ -171,11 +183,62 @@ for name in md:
   if "influxdb" in md[name]:
     md[name].update(influxdbs[md[name]["influxdb"]])
     
+parser = argparse.ArgumentParser(usage="%(prog)s [OPTION]",description="Modbus datalogger.")
+parser.add_argument( "--device",   help="device from ini file we should talk to" )
+parser.add_argument( "--variable", help="variable we should set" )
+parser.add_argument( "--value",    help="value to set" )
+args = parser.parse_args()
+if len(sys.argv) >= 2:
+  if args.device and args.variable and args.value:
+    if args.device in md:
+      if "vars" in md[args.device]:
+        if args.variable in md[args.device]["vars"]:
+          lock_pointer = acquire_lock("modbus_logger")
+          if not lock_pointer:
+            print('Could not acquire lock.')
+            sys.exit(1)
+          md[args.device]["conn"].connect()
+          if md[args.device]["vars"][args.variable]["Typ"] == 3:
+            if "Mult" in md[args.device]["vars"][args.variable]:
+              set_value=float(args.value)/md[args.device]["vars"][args.variable]["Mult"]
+              set_value=int(set_value)
+            mbargs = {
+                      "address":  md[args.device]["vars"][args.variable]["Addr"],
+                      "value":    set_value
+                     }
+            if "slaveid" in md[args.device]:
+              mbargs["device_id"]=md[args.device]["slaveid"]
+            print("Writing with argument")
+            print(mbargs)
+            md[args.device]["conn"].write_register(**mbargs) 
+            md[args.device]["conn"].close()
+          else:
+            print(f'Known variable {args.variable} for known device {args.device} is not of type 3!')
+            sys.exit(1)
+          try:
+            os.close(lock_pointer)
+          except:
+            print('Failed to close lock pointer.')
+            sys.exit(1)
+        else:
+          print(f'Unknown variable {args.variable} for known device {args.device}')
+          sys.exit(1)
+      else:
+        print(f'Known device {args.device} has no variables we can set.')
+        sys.exit(1)
+    else:
+      print(f'Unknown device {args.device}')
+      sys.exit(1)
+    sys.exit(0)
+  else:
+    parser.print_help()
+    sys.exit(1)
+
 # 01.01.1970 - führt dazu, dass in der folgenden Schleife beim ersten Mal das Warten zu Anfang unterbleibt
-laststart=datetime.datetime.fromtimestamp(0)
+laststart=datetime.datetime.fromtimestamp(0,tz=datetime.UTC)
 
 while True:
-  now=datetime.datetime.utcnow()
+  now=datetime.datetime.now(datetime.UTC)
   # Wie viel Zeit ist seit dem letzten Datenpunkt vergangen?
   td=now-laststart
   # Wie lange müssen wir noch warten, damit zwischen den Datenpunkten genau "interval" liegt?
@@ -191,19 +254,29 @@ while True:
       print('Proceeding with data taking right away.')
 
   # Zeitstempel des letzten Durchgangs merken
-  laststart=datetime.datetime.utcnow()
+  laststart=datetime.datetime.now(datetime.UTC)
 
   for mdrun,mdrundat in md.items():
+    # Lock 
+    lock_pointer = acquire_lock("modbus_logger")
+    if not lock_pointer:
+      print('Could not acquire lock.')
+      continue
+
     # Verbindung aufbauen. 
     try:
       mdrundat["conn"].connect()
     except Exception as e:
       print(e)
       print('Modbus connection failed.')
+      try:
+        os.close(lock_pointer)
+      except:
+        print('Failed to close lock pointer.')
       continue
 
     # Zeitstempel des Datenpunktes merken
-    datatime=datetime.datetime.utcnow()
+    datatime=datetime.datetime.now(datetime.UTC)
 
     # Leerer dictionary für die Messergebnisse und deren Nachkommastellen (für floats). 
     meas={}
@@ -218,28 +291,35 @@ while True:
     # In diese Dateien wandert die Statusausgabe für Icinga. Wird dann von einem Icinga plugin ausgelesen. 
     statusfilename=f'/var/local/lib/modbus_logger/{mdrun}.txt'
     if debug:
-      statusfilename=f'/usr/local/var/lib/modbus_logger/{mdrun}_debug.txt'
+      statusfilename=f'/var/local/lib/modbus_logger/{mdrun}_debug.txt'
     statusfilenametmp=statusfilename + '.tmp'
     # Jetzt geht es los mit dem Daten einlesen.
     # Schleife über alle einzulesenden Register
     for var,vardat in mdrundat["vars"].items(): 
       try:
+        mbargs = { "address":  vardat["Addr"] }
+        if "slaveid" in mdrundat:
+          mbargs["slave"] = mdrundat["slaveid"]
+        if vardat["Typ"] == 3 or vardat["Typ"] ==4:
+          mbargs["count"]=dl[vardat["Dt"]]
+        else:
+          mbargs["count"] = 1
+
         if vardat["Typ"] == 1:
-          result = mdrundat["conn"].read_coils(vardat["Addr"],count=1,slave=mdrundat["slaveid"])
+          result = mdrundat["conn"].read_coils(**mbargs)
           num_results = result.bits 
         elif vardat["Typ"] == 2:
-          result = mdrundat["conn"].read_discrete_inputs(vardat["Addr"],count=1,slave=mdrundat["slaveid"])
+          result = mdrundat["conn"].read_discrete_inputs(**mbargs)
           num_results = result.bits
         elif vardat["Typ"] == 3:
-          result = mdrundat["conn"].read_holding_registers(vardat["Addr"],count=dl[vardat["Dt"]],slave=mdrundat["slaveid"])
+          result = mdrundat["conn"].read_holding_registers(**mbargs)
           num_results = result.registers
         elif vardat["Typ"] == 4:
-          result = mdrundat["conn"].read_input_registers(vardat["Addr"],count=dl[vardat["Dt"]],slave=mdrundat["slaveid"])
+          result = mdrundat["conn"].read_input_registers(**mbargs)
           num_results = result.registers
       except Exception as e:
-        print(result)
         print(e)
-        errmsg = f'Unable to read {dl[vardat["Dt"]]} bytes from slave {mdrundat["slaveid"]}, address {vardat["Addr"]} using function code {vardat["Typ"]}.'
+        errmsg = f'Unable to read {mbargs["count"]} bytes from slave {mbargs.get("slaveid","N/A")}, address {mbargs["address"]} using function code {vardat["Typ"]}.'
         print(errmsg)
         checkres = 3
         checkstr += " " + errmsg
@@ -251,15 +331,14 @@ while True:
         checkres=3
         checkstr += " " + errmsg
         break 
-      decoder = BinaryPayloadDecoder.fromRegisters(num_results, byteorder=bo[mdrundat["endian_byte"]], wordorder=bo[mdrundat["endian_word"]])
       if   vardat["Dt"] == "uint32":
-        val = decoder.decode_32bit_uint()
+        val = mdrundat["conn"].convert_from_registers(result.registers,data_type=mdrundat["conn"].DATATYPE.UINT32)
       elif vardat["Dt"] == "int32":
-        val = decoder.decode_32bit_int()
+        val = mdrundat["conn"].convert_from_registers(result.registers,data_type=mdrundat["conn"].DATATYPE.INT32)
       elif vardat["Dt"] == "uint16":
-        val = decoder.decode_16bit_uint()
+        val = mdrundat["conn"].convert_from_registers(result.registers,data_type=mdrundat["conn"].DATATYPE.UINT16)
       elif vardat["Dt"] == "int16":
-        val = decoder.decode_16bit_int()
+        val = mdrundat["conn"].convert_from_registers(result.registers,data_type=mdrundat["conn"].DATATYPE.INT16)
       elif vardat["Dt"] == "bool":
         val = num_results[0] 
       # Eigentlich sollten Bits ja in coils gespeichert werden. Dieser Code erlaubt es, auch einzelne Bits eines holding registers auszuwerten...
@@ -313,6 +392,17 @@ while True:
             print(f'{var: <18} = {val!s:^6}({vardat["Comment"]})')
           else:
             print(f'{var: <18} = {val:6.{decs[var]}f} {vardat["Unit"]: <4} ({vardat["Comment"]})')
+    try:
+      mdrundat["conn"].close()
+    except Exception as e:
+      print(e)
+      print('Modbus connection failed to close.')
+    try:
+      os.close(lock_pointer)
+    except Exception as e:
+      print(e)
+      print('Lock pointer failed to close.')
+  
     # Wenn Daten da sind und wir nicht im Debug Modus sind und wenn kein Kommunikationsfehler auftrat, werden die Daten in InfluxDB geschrieben. 
     if not debug:
       if "influxdb" in mdrundat:
@@ -342,21 +432,26 @@ while True:
 
     # Statusfile für Icinga geht auf die Platte. 
     try:
-      f=open(statusfilenametmp,'w')
-      for namerun,valrun in meas.items():
-        perfstr += f"'{namerun}'="
-        if namerun in decs:
-          perfstr += f'{valrun:.{decs[namerun]}f}'
-        else:
-          perfstr += f'{valrun}'
-        perfstr += ";U:U;U:U;U;U "
-      f.write(f'{checkres}\n')
-      checkstr = f' {mdrundat["comment"]}{checkstr}'
-      f.write(f'{checkstr} |{perfstr}')
-      f.close()
+      with open(statusfilenametmp,'w') as f:
+        for namerun,valrun in meas.items():
+          perfstr += f"'{namerun}'="
+          if namerun in decs:
+            perfstr += f'{valrun:.{decs[namerun]}f}'
+          else:
+            perfstr += f'{valrun}'
+          perfstr += ";U:U;U:U;U;U "
+        f.write(f'{checkres}\n')
+        checkstr = f' {mdrundat["comment"]}{checkstr}'
+        f.write(f'{checkstr} |{perfstr}')
+        f.close()
+    except Exception as e:
+      print('Could not write to tmp Icinga status file')
+      print(e)
+    try:
       os.replace(statusfilenametmp,statusfilename)
-    except:
+    except Exception as e:
       print('Could not write to Icinga status file.')
+      print(e)
 
     time.sleep(1)
 
