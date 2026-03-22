@@ -54,7 +54,6 @@ md={}
 
 # Acquire a lock so that other programs no we may be sending data
 def acquire_lock(label="default"):
-
     # Create empty lock file if it does not exist yet
     lock_file = "/root/.instance_" + label + ".lock"
     if not os.path.isfile(lock_file):
@@ -73,13 +72,18 @@ def acquire_lock(label="default"):
 # Get first register of given type
 def get_first_register(mdname,regtype):
   global md
+  global debug
   first_addr=None
   first_name=None
+  if debug:
+    print(f'get_first_register(): mdname={mdname} regtype={regtype}')
   for run_name,run_details in md[mdname]["vars"].items():
     run_addr=run_details["Addr"]
     # Look at only those registers where the type matches
     if run_details["Typ"] == regtype:
-      if first_addr:
+      if debug:
+        print(f'get_first_register(): run_name={run_name} run_addr={run_addr} first_addr={first_addr}')
+      if first_addr != None:
         # We already have a candidate based on previous iterations. 
         # Is the current item "lower"?
         if (run_addr < first_addr) or ((run_addr == first_addr) and (run_name < name)):
@@ -104,7 +108,7 @@ def get_next_register(mdname,regtype,addr,name):
       # Current item is a candidate because either its address is higher than the 
       # input address or equal, but in the latter case the name is "higher" than the input name
       if (run_addr > addr) or ((run_addr == addr) and (run_name > name)):
-        if next_addr:
+        if next_addr != None:
           # We already have a candidate based on previous iterations. 
           # Is the current item "lower"?
           if (run_addr < next_addr) or ((run_addr == next_addr) and (run_name < next_name)):
@@ -129,7 +133,7 @@ def get_prev_register(mdname,regtype,addr,name):
       # Current item is a candidate because either its address is lower than the 
       # input address or equal, but in the latter case the name is "lower" than the input name
       if (run_addr < addr) or ((run_addr == addr) and (run_name < name)):
-        if prev_addr:
+        if prev_addr != None:
           # We already have a candidate based on previous iterations. 
           # Is the current item "higer"?
           if (run_addr > prev_addr) or ((run_addr == prev_addr) and (run_name > prev_name)):
@@ -162,7 +166,7 @@ def set_memory_blocks(mdname):
     start_addr = run_addr
     # i is the index of the memory block
     i = 0
-    while run_addr:
+    while run_addr != None:
       if debug:
         print(f'set_memory_blocks: {run_addr} {run_name}')
       run_details["memory_block"] = i
@@ -172,7 +176,7 @@ def set_memory_blocks(mdname):
       # Adding the next register would make this data block longer than 125 words.
       # Or this is the last register. 
       # In either case, close the current memory block.
-      if not next_addr or next_addr + dl[next_details["Dt"]] - start_addr >= 125:
+      if next_addr == None or next_addr + dl[next_details["Dt"]] - start_addr >= 125:
         md[mdname]["memory_blocks"][regtype].append({ "start_addr": start_addr, "length": run_addr + dl[run_details["Dt"]] - start_addr, "data": None })
         i = i + 1
         start_addr = next_addr
