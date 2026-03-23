@@ -52,7 +52,16 @@ dl = { "uint32":  2,
 # This dict will hold the modbus devices
 md={}
 
-# Acquire a lock so that other programs no we may be sending data
+# This dict will hold the modbus device classes
+mdc={}
+
+# This dict will hold the modbus connections
+mc={}
+
+# This dict will hold the influxdb databases
+ic={}
+
+# Acquire a lock so that other programs know we may be sending data
 def acquire_lock(label="default"):
     # Create empty lock file if it does not exist yet
     lock_file = "/root/.instance_" + label + ".lock"
@@ -70,19 +79,13 @@ def acquire_lock(label="default"):
         return(None)
 
 # Get first register of given type
-def get_first_register(mdname,regtype):
-  global md
-  global debug
+def get_first_register(this_mdc,regtype):
   first_addr=None
   first_name=None
-  if debug:
-    print(f'get_first_register(): mdname={mdname} regtype={regtype}')
-  for run_name,run_details in md[mdname]["vars"].items():
+  for run_name,run_details in this_mdc["vars"].items():
     run_addr=run_details["Addr"]
     # Look at only those registers where the type matches
     if run_details["Typ"] == regtype:
-      if debug:
-        print(f'get_first_register(): run_name={run_name} run_addr={run_addr} first_addr={first_addr}')
       if first_addr != None:
         # We already have a candidate based on previous iterations. 
         # Is the current item "lower"?
@@ -97,11 +100,10 @@ def get_first_register(mdname,regtype):
   return(first_addr,first_name)
 
 # Get next register of given type
-def get_next_register(mdname,regtype,addr,name):
-  global md
+def get_next_register(this_mdc,regtype,addr,name):
   next_addr=None
   next_name=None
-  for run_name,run_details in md[mdname]["vars"].items():
+  for run_name,run_details in this_mdc["vars"].items():
     run_addr=run_details["Addr"]
     # Look at only those registers where the type matches
     if run_details["Typ"] == regtype:
@@ -122,11 +124,10 @@ def get_next_register(mdname,regtype,addr,name):
   return([next_addr,next_name])
 
 # Get previous register of given type
-def get_prev_register(mdname,regtype,addr,name):
-  global md
+def get_prev_register(this_mdc,regtype,addr,name):
   prev_addr=None
   prev_name=None
-  for run_name,run_details in md[mdname]["vars"].items():
+  for run_name,run_details in this_mdc["vars"].items():
     run_addr=run_details["Addr"]
     # Look at only those registers where the type matches
     if run_details["Typ"] == regtype:
@@ -147,328 +148,249 @@ def get_prev_register(mdname,regtype,addr,name):
   return([prev_addr,prev_name])
 
 # Get register info of given type by address
-def get_varinfo_by_address(mdname,regtype,addr,name):
-  global md
-  for run_name,run_details in md[mdname]["vars"].items():
+def get_varinfo_by_address(this_mdc,regtype,addr,name):
+  for run_name,run_details in this_mdc["vars"].items():
     run_addr = run_details["Addr"]
     if run_name == name and run_addr == addr:
       return(run_details)
   return (None)
 
 # Assign continuous memory blocks of at most 125 word length for a device
-def set_memory_blocks(mdname):
-  global md
-  md[mdname]["memory_blocks"] = dict()
+def set_memory_blocks(this_mdc):
+  this_mdc["memory_blocks"] = dict()
   for regtype in [1,2,3,4]:
-    md[mdname]["memory_blocks"][regtype] = []
-    (run_addr,run_name) = get_first_register(mdname,regtype)
-    run_details = get_varinfo_by_address(mdname,regtype,run_addr,run_name)
+    this_mdc["memory_blocks"][regtype] = []
+    (run_addr,run_name) = get_first_register(this_mdc,regtype)
+    run_details = get_varinfo_by_address(this_mdc,regtype,run_addr,run_name)
     start_addr = run_addr
     # i is the index of the memory block
     i = 0
+    varlist = []
     while run_addr != None:
-      if debug:
-        print(f'set_memory_blocks: {run_addr} {run_name}')
-      run_details["memory_block"] = i
-      run_details["memory_offset"] = run_addr - start_addr
-      (next_addr,next_name) = get_next_register(mdname,regtype,run_addr,run_name)
-      next_details = get_varinfo_by_address(mdname,regtype,next_addr,next_name)
+      varlist.append(run_name)
+      run_details["memory_block_index"] = i
+      run_details["memory_block_offset"] = run_addr - start_addr
+      (next_addr,next_name) = get_next_register(this_mdc,regtype,run_addr,run_name)
+      next_details = get_varinfo_by_address(this_mdc,regtype,next_addr,next_name)
       # Adding the next register would make this data block longer than 125 words.
       # Or this is the last register. 
       # In either case, close the current memory block.
       if next_addr == None or next_addr + dl[next_details["Dt"]] - start_addr >= 125:
-        md[mdname]["memory_blocks"][regtype].append({ "start_addr": start_addr, "length": run_addr + dl[run_details["Dt"]] - start_addr, "data": None })
+        this_mdc["memory_blocks"][regtype].append({ "start_addr": start_addr, "length": run_addr + dl[run_details["Dt"]] - start_addr, "varlist": varlist })
         i = i + 1
         start_addr = next_addr
+        varlist = []
       run_addr = next_addr
       run_name = next_name
       run_details = next_details
 
 # This is the function that actually reads the data via modbus and stores it in the memory blocks
-def read_data(mdname, checkres, checkstr):
-  global md
-  global debug
+def read_data(this_md, checkres, checkstr):
+  # Establish the modbus connection
+  this_mc=this_md["mc"]
+  this_mdc=this_md["mdc"]
+  try:
+    if   this_mc["type"] == "u":
+      conn = ModbusUdpClient(this_mc["host"],port=this_mc["port"],timeout=1,retries=1)
+    elif this_mc["type"] == "t":
+      conn = ModbusTcpClient(this_mc["host"],port=this_mc["port"],timeout=1,retries=1)
+    elif this_mc["type"] == "r":
+      conn = ModbusSerialClient(port=this_mc["serialdevice"],baudrate=this_mc["baudrate"],bytesize = this_mc["bytesize"],parity=this_mc["parity"],stopbits=this_mc["stopbits"],timeout=1,retries=1)
+  except Exception as e:
+    conn = None
+    print(f'Could not set up modbus connection.')
+  try:
+    conn.connect()
+  except Exception as e:
+    conn = None
+    print('Modbus failed to connect.')
 
   for regtype in [1,2,3,4]:
-    for memory_block in md[mdname]["memory_blocks"][regtype]:
+    for memory_block in this_mdc["memory_blocks"][regtype]:
       loaded = False
       if debug:
         print(f'Reading {memory_block["length"]} words starting from address {memory_block["start_addr"]}.')
       mbargs = { "address": memory_block["start_addr"] }
-      if "slaveid" in md[mdname]:
-        mbargs["slave"] = md[mdname]["slaveid"]
+      if "slaveid" in this_md:
+        mbargs["slave"] = this_md["slaveid"]
       mbargs["count"] = memory_block["length"]
-      i = 0
-      while not loaded and i < 5:
-        try:
-          if   regtype == 1:
-            result = md[mdname]["conn"].read_coils(**mbargs)
-            loaded = True
-          elif regtype == 2:
-            result = md[mdname]["conn"].read_discrete_inputs(**mbargs)
-            loaded = True
-          elif regtype == 3:
-            result = md[mdname]["conn"].read_holding_registers(**mbargs)
-            loaded = True
-          elif regtype == 4:
-            result = md[mdname]["conn"].read_input_registers(**mbargs)
-            loaded = True
-        except Exception as e:
-          loaded = False
-        if loaded:
-          try:
-            if   regtype == 1:
-              memory_block["data"] = result.bits
-              loaded = True
-            elif regtype == 2:
-              memory_block["data"] = result.bits
-              loaded = True
-            elif regtype == 3:
-              memory_block["data"] = result.registers
-              loaded = True
-            elif regtype == 4:
-              memory_block["data"] = result.registers
-              loaded = True
-          except Exception as e:
-            memory_block["data"] = None
-            loaded = False
-        i += 1
-      if not loaded:
+      try:
+        if   regtype == 1:
+          result = conn.read_coils(**mbargs)
+        elif regtype == 2:
+          result = conn.read_discrete_inputs(**mbargs)
+        elif regtype == 3:
+          result = conn.read_holding_registers(**mbargs)
+        elif regtype == 4:
+          result = conn.read_input_registers(**mbargs)
+      except Exception as e:
         checkstr = checkstr + f' read_fail({regtype},{memory_block["start_addr"]},{memory_block["length"]})'
-        checkres = 2
+        checkres = 3
+        for var in memory_block["varlist"]:
+          this_mdc["vars"][var]["Val"] = None
+        continue
+      for var in memory_block["varlist"]:
+        this_var = this_mdc["vars"][var]
+        if   this_var["Dt"] == "uint32":
+          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                            data_type=conn.DATATYPE.UINT32,word_order=this_mdc["word_order"])
+        elif this_var["Dt"] == "int32":
+          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                            data_type=conn.DATATYPE.INT32,word_order=this_mdc["word_order"])
+        elif this_var["Dt"] == "uint16":
+          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                            data_type=conn.DATATYPE.UINT16,word_order=this_mdc["word_order"])
+        elif this_var["Dt"] == "int16":
+          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                            data_type=conn.DATATYPE.INT16,word_order=this_mdc["word_order"])
+        elif this_var["Dt"] == "uint8":
+          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                            data_type=conn.DATATYPE.UINT16,word_order=this_mdc["word_order"])
+        elif this_var["Dt"] == "int8":
+          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                            data_type=conn.DATATYPE.INT16,word_order=this_mdc["word_order"])
+        elif this_var["Dt"] == "float16":
+          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                            data_type=conn.DATATYPE.FLOAT16,word_order=this_mdc["word_order"])
+        elif this_var["Dt"] == "float32":
+          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                            data_type=conn.DATATYPE.FLOAT32,word_order=this_mdc["word_order"])
+        elif this_var["Dt"] == "bool":
+          val = result.bits[this_var["memory_block_offset"]]
+        if this_var["Dt"].startswith("uint") and this_var["BitNum"] != None:
+          val = ( val & ( 1 << this_var["BitNum"] ) ) >> this_var["BitNum"]
+        if this_var["Decs"] != 0:
+          val = val*this_var["Mult"]
+
+        # It is possible to set a default value. If the measured value deviates from that, we produce 
+        # an alert through the nagios plugin.  
+        if this_var["Dflt"] != None:
+          if this_var["Dflt"] != val:
+            if checkres<2:
+              checkres=2
+              checkstr += f' {var}={val} (should be {this_var["Dflt"]})'
+        # It is possible to set limits. If those are exceeded, the nagios plugin will throw an alert.  
+        # "WARNING" (checkres=1) and "CRITICAL" (checkres=2)
+        if this_var["MaxCrit"] != None:
+          if val > this_var["MaxCrit"]:
+            if checkres<2:
+              checkres=2
+              checkstr += f' {var}={val:.{this_var["Decs"]}f} {this_var["Unit"]} > {this_var["MaxCrit"]} {this_var["Unit"]}'
+          elif val > this_var["MaxWarn"]:
+            if checkres<1:
+              checkres=1
+              checkstr += f' {var}={val:.{this_var["Decs"]}f} {this_var["Unit"]} > {this_var["MaxWarn"]} {this_var["Unit"]}'
+        if this_var["MinCrit"] != None:
+          if val < this_var["MinCrit"]:
+            if checkres<2:
+              checkres=2
+              checkstr += f' {var}={val:.{this_var["Decs"]}f} {this_var["Unit"]} < {this_var["MinCrit"]} {this_var["Unit"]}'
+          elif val < this_var["MinWarn"]:
+            if checkres<1:
+              checkres=1
+              checkstr += f' {var}={val:.{this_var["Decs"]}f} {this_var["Unit"]} < {this_var["MinWarn"]} {this_var["Unit"]}'
+        this_var["Val"] = val
+        if debug:
+          print(f'  {var} {val}')
+  if conn != None:
+    conn.close()
   return(checkres, checkstr)
-
-# Get a specific value from the memory blocks
-def get_value(mdname, name, checkres, checkstr):
-  global md
-  global debug
-  if debug:
-    print(f'get_value: mdname={mdname} name={name}')
-  mult = md[mdname]["vars"][name]["Mult"]
-  dflt = md[mdname]["vars"][name].get("Dflt",None)
-  maxcrit = md[mdname]["vars"][name].get("maxcrit",None)
-  maxwarn = md[mdname]["vars"][name].get("maxwarn",None)
-  mincrit = md[mdname]["vars"][name].get("mincrit",None)
-  minwarn = md[mdname]["vars"][name].get("minwarn",None)
-  comment = md[mdname]["vars"][name].get("Comment","")
-  regtype = md[mdname]["vars"][name]["Typ"]
-  dt = md[mdname]["vars"][name]["Dt"]
-  memory_block_index = md[mdname]["vars"][name]["memory_block"]
-  memory_block_offset = md[mdname]["vars"][name]["memory_offset"]
-  errorcode = 0
-  errormsg = ""
-  if md[mdname]["memory_blocks"][regtype][memory_block_index]["data"] != None:
-    if   dt == "uint32":
-      val = md[mdname]["conn"].convert_from_registers(md[mdname]["memory_blocks"][regtype][memory_block_index]["data"][memory_block_offset:memory_block_offset+dl[dt]],
-                                                      data_type=md[mdname]["conn"].DATATYPE.UINT32,
-                                                      word_order=md[mdname]["endian_word"])
-    elif dt == "int32":
-      val = md[mdname]["conn"].convert_from_registers(md[mdname]["memory_blocks"][regtype][memory_block_index]["data"][memory_block_offset:memory_block_offset+dl[dt]],
-                                                      data_type=md[mdname]["conn"].DATATYPE.INT32,
-                                                      word_order=md[mdname]["endian_word"])
-    elif dt == "uint16":
-      val = md[mdname]["conn"].convert_from_registers(md[mdname]["memory_blocks"][regtype][memory_block_index]["data"][memory_block_offset:memory_block_offset+dl[dt]],
-                                                      data_type=md[mdname]["conn"].DATATYPE.UINT16,
-                                                      word_order=md[mdname]["endian_word"])
-    elif dt == "int16":
-      val = md[mdname]["conn"].convert_from_registers(md[mdname]["memory_blocks"][regtype][memory_block_index]["data"][memory_block_offset:memory_block_offset+dl[dt]],
-                                                      data_type=md[mdname]["conn"].DATATYPE.INT16,
-                                                      word_order=md[mdname]["endian_word"])
-    elif dt == "uint8":
-      val = md[mdname]["conn"].convert_from_registers(md[mdname]["memory_blocks"][regtype][memory_block_index]["data"][memory_block_offset:memory_block_offset+dl[dt]],
-                                                      data_type=md[mdname]["conn"].DATATYPE.UINT16,
-                                                      word_order=md[mdname]["endian_word"])
-    elif dt == "int8":
-      val = md[mdname]["conn"].convert_from_registers(md[mdname]["memory_blocks"][regtype][memory_block_index]["data"][memory_block_offset:memory_block_offset+dl[dt]],
-                                                      data_type=md[mdname]["conn"].DATATYPE.INT16,
-                                                      word_order=md[mdname]["endian_word"])
-    elif dt == "float16":
-      val = md[mdname]["conn"].convert_from_registers(md[mdname]["memory_blocks"][regtype][memory_block_index]["data"][memory_block_offset:memory_block_offset+dl[dt]],
-                                                      data_type=md[mdname]["conn"].DATATYPE.FLOAT16,
-                                                      word_order=md[mdname]["endian_word"])
-    elif dt == "float32":
-      val = md[mdname]["conn"].convert_from_registers(md[mdname]["memory_blocks"][regtype][memory_block_index]["data"][memory_block_offset:memory_block_offset+dl[dt]],
-                                                      data_type=md[mdname]["conn"].DATATYPE.FLOAT32,
-                                                      word_order=md[mdname]["endian_word"])
-    elif dt == "bool":
-      val = md[mdname]["memory_blocks"][regtype][memory_block_index]["data"][memory_block_offset]
-    if dt.startswith("uint") and "BitNum" in md[mdname]["vars"][name]:
-      val = ( val & ( 1 << md[mdname]["vars"][name]["BitNum"] ) ) >> md[mdname]["vars"][name]["BitNum"]
-    decs = round(math.log10(mult))
-    if decs < 0:
-      decs = abs(decs)
-    else:
-      decs = 0
-    if decs != 0:
-      val = val*mult
-
-    # It is possible to set a default value. If the measured value deviates from that, we produce 
-    # an alert through the nagios plugin.  
-    if dflt != None:
-      if dflt != val:
-        if checkres<2:
-          checkres=2
-          checkstr += f' {name}={val} (should be {dflt})'
-    # It is possible to set limits. If those are exceeded, the nagios plugin will throw an alert.  
-    # "WARNING" (checkres=1) and "CRITICAL" (checkres=2)
-    if maxcrit != None:
-      if val > maxcrit:
-        if checkres<2:
-          checkres=2
-          checkstr += f' {name}={val:.{decs}f} {unit} > {maxcrit} {unit}'
-      elif val > maxwarn:
-        if checkres<1:
-          checkres=1
-          checkstr += f' {name}={val:.{decs}f} {unit} > {maxwarn} {unit}'
-    if mincrit != None:
-      if val < mincrit:
-        if checkres<2:
-          checkres=2
-          checkstr += f' {name}={val:.{decs}f} {unit} < {mincrit} {unit}'
-      elif val < minwarn:
-        if checkres<1:
-          checkres=1
-          checkstr += f' {name}={val:.{decs}f} {unit} < {minwarn} {unit}'
-    return (val, decs, checkres, checkstr)
-  else:
-    return (None, 0, checkres, checkstr)
 
 # The main loop
 def modbus_logger():
-
-  global md
-  global debug
-  global interval
-
-  # This dict will hold the modbus device classes
-  mdc={}
-
-  # This dict will hold the modbus connections
-  mc={}
-
-  # This dict will hold the influxdb databases
-  influxdbs={}
 
   iniparser = configparser.ConfigParser()
   iniparser.optionxform=str
   iniparser.read('/usr/local/etc/modbus_logger.ini')
   for section in iniparser.sections():
-    [ sectiontype, name ] = section.split(" ",1)
-    if sectiontype == "modbus_device_class":
-      mdc[name]={}
+    section_head = section.split(" ")
+    section_type = section_head[0]
+    section_name = section_head[1]
+    section_options = section_head[2:]
+    if section_type == "modbus_device_class":
+      mdc[section_name]={}
+      mdc[section_name]["vars"]={}
+      if "word_order_little" in section_options:
+        mdc[section_name]["word_order"] = "little"
+      else:
+        mdc[section_name]["word_order"] = "big"
       for key in iniparser[section]:
         try:
-          mdc[name][key] = json.loads(iniparser[section][key])
+          mdc[section_name]["vars"][key] = json.loads(iniparser[section][key])
         except Exception as e:
           print(e)
-          print(f'JSON parse error in [{sectiontype} {name}], key {key}. Bye.')
+          print(f'JSON parse error in [{section_type} {section_name}], key {key}. Bye.')
           sys.exit(1)
-        if mdc[name][key]["Typ"] == 1:
-          mdc[name][key]["Dt"] = "bool"
-    if sectiontype == "modbus_device":
-      md[name]={}
+        if mdc[section_name]["vars"][key]["Typ"] == 1 or mdc[section_name]["vars"][key]["Typ"] == 2:
+          mdc[section_name]["vars"][key]["Dt"] = "bool"
+        else:
+          mdc[section_name]["vars"][key]["Dt"] = mdc[section_name]["vars"][key].get("Dt","int16")
+        mdc[section_name]["vars"][key]["Mult"]    = mdc[section_name]["vars"][key].get("Mult",1)
+        mdc[section_name]["vars"][key]["Unit"]    = mdc[section_name]["vars"][key].get("Unit","")
+        mdc[section_name]["vars"][key]["Comment"] = mdc[section_name]["vars"][key].get("Comment",key)
+        mdc[section_name]["vars"][key]["Dflt"]    = mdc[section_name]["vars"][key].get("Dflt",None)
+        mdc[section_name]["vars"][key]["MaxCrit"] = mdc[section_name]["vars"][key].get("MaxCrit",None)
+        mdc[section_name]["vars"][key]["MaxWarn"] = mdc[section_name]["vars"][key].get("MaxWarn",None)
+        mdc[section_name]["vars"][key]["MinCrit"] = mdc[section_name]["vars"][key].get("MinCrit",None)
+        mdc[section_name]["vars"][key]["MinWarn"] = mdc[section_name]["vars"][key].get("MinWarn",None)
+        mdc[section_name]["vars"][key]["BitNum"]  = mdc[section_name]["vars"][key].get("BitNum",None)
+        mdc[section_name]["vars"][key]["Decs"]    = round(math.log10(mdc[section_name]["vars"][key]["Mult"]))
+        if mdc[section_name]["vars"][key]["Decs"] < 0:
+          mdc[section_name]["vars"][key]["Decs"] = abs(mdc[section_name]["vars"][key]["Decs"])
+        else:
+          mdc[section_name]["vars"][key]["Decs"] = 0
+      set_memory_blocks(mdc[section_name])
+    if section_type == "modbus_device":
+      md[section_name]={}
       for key in iniparser[section]:
         try:
-          md[name][key] = json.loads(iniparser[section][key])
+          md[section_name][key] = json.loads(iniparser[section][key])
         except Exception as e:
           print(e)
-          print(f'JSON parse error in [{sectiontype} {name}], key {key}. Bye.')
+          print(f'JSON parse error in [{section_type} {section_name}], key {key}. Bye.')
           sys.exit(1)
-    if sectiontype == "influxdb":
-      influxdbs[name]={}
+    if section_type == "influxdb":
+      ic[section_name]={}
       for key in iniparser[section]:
         try:
-          influxdbs[name][key] = json.loads(iniparser[section][key])
+          ic[section_name][key] = json.loads(iniparser[section][key])
         except Exception as e:
           print(e)
-          print(f'JSON parse error in [{sectiontype} {name}], key {key}. Bye.')
+          print(f'JSON parse error in [{section_type} {section_name}], key {key}. Bye.')
           sys.exit(1)
-    if sectiontype == "modbus_connection":
-      mc[name]={}
+    if section_type == "modbus_connection":
+      mc[section_name]={}
       for key in iniparser[section]:
         try:
-          mc[name][key] = json.loads(iniparser[section][key])
+          mc[section_name][key] = json.loads(iniparser[section][key])
         except Exception as e:
           print(e)
-          print(f'JSON parse error in [{sectiontype} {name}], key {key}. Bye.')
+          print(f'JSON parse error in [{section_type} {section_name}], key {key}. Bye.')
           sys.exit(1)
 
-  # Appply some defaults
-  for name in mc:
-    mc[name]["parity"]   = mc[name].get("parity","N")
-    mc[name]["stopbits"] = mc[name].get("stopbits",1)
-    mc[name]["bytesize"] = mc[name].get("bytesize",8)
-    mc[name]["baudrate"] = mc[name].get("baudrate",38400)
-    mc[name]["port"]     = mc[name].get("port",502)
+  # Set up modbus connections
+  for this_mc_name,this_mc in mc.items():
+    this_mc["parity"]   = this_mc.get("parity","N")
+    this_mc["stopbits"] = this_mc.get("stopbits",1)
+    this_mc["bytesize"] = this_mc.get("bytesize",8)
+    this_mc["baudrate"] = this_mc.get("baudrate",38400)
+    this_mc["port"]     = this_mc.get("port",502)
 
-  for name in md:  
-    md[name]["endian_word"] = md[name].get("modbus_endian_word","big")
-
-  for name in mdc:  
-    for var in mdc[name]:
-      mdc[name][var]["Dt"]      = mdc[name][var].get("Dt","int16")
-      mdc[name][var]["Mult"]    = mdc[name][var].get("Mult",1)
-      mdc[name][var]["Unit"]    = mdc[name][var].get("Unit","")
-      mdc[name][var]["Comment"] = mdc[name][var].get("Comment",var)
-
-
-  # Start influxdb client
-  for db,dbvals in influxdbs.items():
+  # Start influxdb clients
+  for this_ic_name,this_ic in ic.items():
     try:
-      influxdbs[db]["influxconn"] = InfluxDBClient(**dbvals)
+      this_ic["cono"] = InfluxDBClient(**this_ic)
     except Exception as e:
       print(e)
       print(f'Could not setup InfluxDB client {db}. Bye.')
       sys.exit(1)
 
-  # Set up modbus connections
-  for name in mc:
-    if   mc[name]["type"] == "u":
-      try:
-        mc[name]["conn"] = ModbusUdpClient(mc[name]["host"],port=mc[name]["port"],timeout=1,retries=1)
-      except Exception as e:
-        print(e)
-        print(f'Could not set up modbus udp connection {name} (Host {mc[name]["host"]}, Port {mc[name]["port"]}). Bye.')
-        print(mc[name]["conn"])
-        sys.exit(1)
-    elif mc[name]["type"] == "t":
-      try:
-        mc[name]["conn"] = ModbusTcpClient(mc[name]["host"],port=mc[name]["port"],timeout=1,retries=1)
-      except Exception as e:
-        print(e)
-        print(f'Could not set up modbus tcp connection {name} (Host {mc[name]["host"]}, Port {mc[name]["port"]}). Bye.')
-        print(mc[name]["conn"])
-        sys.exit(1)
-    elif mc[name]["type"] == "r":
-      try:
-        mc[name]["conn"] = ModbusSerialClient(port     = mc[name]["serialdevice"],
-                                              baudrate = mc[name]["baudrate"],
-                                              bytesize = mc[name]["bytesize"],
-                                              parity   = mc[name]["parity"],
-                                              stopbits = mc[name]["stopbits"],
-                                              timeout  = 1,
-                                              retries  = 1)
-      except Exception as e:
-        print(e)
-        print(f'Could not set up modbus rtu client {name} (Device {mc[name]["serialdevice"]} {mc[name]["baudrate"]} {mc[name]["bytesize"]}{mc[name]["parity"]}{mc[name]["stopbits"]}))...')
-        print(mc[name]["conn"])
-        sys.exit(1)
-
-  # Copy the modbus device class info and the modbus connection info and the influxdb info into the device info
-  for name in md:
-    md[name]["vars"] = mdc[md[name]["class"]]
-    md[name].update(mc[md[name]["conn"]])
-    if "influxdb" in md[name]:
-      md[name].update(influxdbs[md[name]["influxdb"]])
-
-  for name in md:
-    # Start modbus connections
-    try:
-      md[name]["conn"].connect()
-    except Exception as e:
-      print(e)
-      print('Modbus connection failed.')
-      sys.exit(1) 
+  # Establish links from the modbus device to the modbus device class, modbus connection and influxdb connection.
+  for this_md_name,this_md in md.items():
+    this_md["mdc"] = mdc[this_md["class"]]
+    this_md["mc"] = mc[this_md["conn"]]
+    if "influxdb" in this_md:
+      this_md["ic"] = ic[this_md["influxdb"]]
 
   # This allows us to write a specific register and terminate
   parser = argparse.ArgumentParser(usage="%(prog)s [OPTION]",description="Modbus datalogger.")
@@ -524,9 +446,6 @@ def modbus_logger():
   # 01/01/1970 - Make sure we start immediately on the first run...
   laststart=datetime.datetime.fromtimestamp(0,tz=datetime.UTC)
 
-  for mdrun,mdrundat in md.items():
-    set_memory_blocks(mdrun)
-
   while True:
     now=datetime.datetime.now(datetime.UTC)
 
@@ -575,7 +494,7 @@ def modbus_logger():
       if not os.path.isfile(tablefilename):
         with open(tablefilename,'w') as f:
           f.write("time".ljust(40))
-          for var,vardat in mdrundat["vars"].items():
+          for var,vardat in mdrundat["mdc"]["vars"].items():
             f.write(var.ljust(max(len(var),15)+1))
           f.write('\n')
 
@@ -584,7 +503,10 @@ def modbus_logger():
       if not lock_pointer:
         print('Could not acquire lock.')
         continue
-      (checkres, checkstr) = read_data(mdrun, checkres, checkstr)
+      if debug:
+        print('')
+        print(f'+++++++ READING {mdrun}')
+      (checkres, checkstr) = read_data(mdrundat, checkres, checkstr)
       try:
         os.close(lock_pointer)
       except Exception as e:
@@ -594,12 +516,12 @@ def modbus_logger():
       # Loop over results
       with open(tablefilename,'a') as f:
         outstr=str(now).ljust(40)
-        for (var,vardat) in mdrundat["vars"].items():
-          ( meas_tmp, decs_tmp, checkres, checkstr ) = get_value(mdrun, var, checkres, checkstr)
-          if meas_tmp != None:
-            meas[var] = meas_tmp
-            decs[var] = decs_tmp
-            if debug:
+        for (var,vardat) in mdrundat["mdc"]["vars"].items():
+          # ( meas_tmp, decs_tmp, checkres, checkstr ) = get_value(mdrundat, var, checkres, checkstr)
+          if vardat["Val"] != None:
+            meas[var] = vardat["Val"]
+            decs[var] = vardat["Decs"]
+            if debug and False:
               if vardat["Typ"] == 1 or vardat["Typ"] == 2:
                 print(f'{var: <18} = {meas[var]!s:^6}({vardat["Comment"]})')
               else:
@@ -624,7 +546,7 @@ def modbus_logger():
               }
             ]
             try:
-              mdrundat["influxconn"].write_points(series)
+              mdrundat["ic"]["cono"].write_points(series)
             except Exception as e:
               print(e)
               print('Could not write to InfluxDB')
@@ -646,14 +568,13 @@ def modbus_logger():
           f.write(f'{checkres}\n')
           checkstr = f' {mdrundat["comment"]}{checkstr}'
           f.write(f'{checkstr} |{perfstr}')
-          f.close()
       except Exception as e:
         print('Could not write to tmp Icinga status file')
         print(e)
       try:
         os.replace(statusfilenametmp,statusfilename)
       except Exception as e:
-        print('Could not write to Icinga status file.')
+        print('Could not replace Icinga status file by tmp Icinga status file.')
         print(e)
 
       time.sleep(1)
