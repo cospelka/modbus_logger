@@ -15,9 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with modbus_logger.  If not, see <http://www.gnu.org/licenses/>.
 
-from pymodbus.client import ModbusTcpClient,ModbusUdpClient,ModbusSerialClient
-from pymodbus.payload import BinaryPayloadDecoder
-from pymodbus.constants import Endian
+from pymodbus.client import ModbusTcpClient,ModbusUdpClient,ModbusSerialClient,ModbusBaseClient
 from influxdb import InfluxDBClient
 import math 
 import time 
@@ -28,6 +26,7 @@ import json
 import os
 import argparse
 import fcntl
+import numbers
 # import asyncio
 
 # Debug mode
@@ -184,11 +183,13 @@ def set_memory_blocks(this_mdc):
       run_name = next_name
       run_details = next_details
 
-# This is the function that actually reads the data via modbus and stores it in the memory blocks
-def read_data(this_md, checkres, checkstr):
-  # Establish the modbus connection
-  this_mc=this_md["mc"]
-  this_mdc=this_md["mdc"]
+# Establish the modbus connection
+def mb_connect(this_md):
+  lock_pointer = acquire_lock(f'modbus_logger_{this_md["conn"]}')
+  this_mc = this_md["mc"]
+  if not lock_pointer:
+    print('Could not acquire lock.')
+    return(None,None)
   try:
     if   this_mc["type"] == "u":
       conn = ModbusUdpClient(this_mc["host"],port=this_mc["port"],timeout=1,retries=1)
@@ -204,6 +205,22 @@ def read_data(this_md, checkres, checkstr):
   except Exception as e:
     conn = None
     print('Modbus failed to connect.')
+  return(conn,lock_pointer)
+
+def mb_close(conn,lock_pointer):
+  try:
+    conn.close()
+  except Exception as e:
+    print(f'Failed do close modbus connecion.')
+  try:
+    os.close(lock_pointer)
+  except:
+    print('Failed to close lock pointer.')
+ 
+# This is the function that actually reads the data via modbus and stores it in the memory blocks
+def read_data(this_md, checkres, checkstr):
+  (conn,lock_pointer)=mb_connect(this_md)
+  this_mdc=this_md["mdc"]
 
   for regtype in [1,2,3,4]:
     for memory_block in this_mdc["memory_blocks"][regtype]:
@@ -231,32 +248,46 @@ def read_data(this_md, checkres, checkstr):
         continue
       for var in memory_block["varlist"]:
         this_var = this_mdc["vars"][var]
-        if   this_var["Dt"] == "uint32":
-          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
-                                            data_type=conn.DATATYPE.UINT32,word_order=this_mdc["word_order"])
-        elif this_var["Dt"] == "int32":
-          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
-                                            data_type=conn.DATATYPE.INT32,word_order=this_mdc["word_order"])
-        elif this_var["Dt"] == "uint16":
-          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
-                                            data_type=conn.DATATYPE.UINT16,word_order=this_mdc["word_order"])
-        elif this_var["Dt"] == "int16":
-          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
-                                            data_type=conn.DATATYPE.INT16,word_order=this_mdc["word_order"])
-        elif this_var["Dt"] == "uint8":
-          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
-                                            data_type=conn.DATATYPE.UINT16,word_order=this_mdc["word_order"])
-        elif this_var["Dt"] == "int8":
-          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
-                                            data_type=conn.DATATYPE.INT16,word_order=this_mdc["word_order"])
-        elif this_var["Dt"] == "float16":
-          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
-                                            data_type=conn.DATATYPE.FLOAT16,word_order=this_mdc["word_order"])
-        elif this_var["Dt"] == "float32":
-          val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
-                                            data_type=conn.DATATYPE.FLOAT32,word_order=this_mdc["word_order"])
-        elif this_var["Dt"] == "bool":
-          val = result.bits[this_var["memory_block_offset"]]
+        try:
+          if   this_var["Dt"] == "uint32":
+            val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                              data_type=conn.DATATYPE.UINT32,word_order=this_mdc["word_order"])
+          elif this_var["Dt"] == "int32":
+            val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                              data_type=conn.DATATYPE.INT32,word_order=this_mdc["word_order"])
+          elif this_var["Dt"] == "uint16":
+            val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                              data_type=conn.DATATYPE.UINT16,word_order=this_mdc["word_order"])
+          elif this_var["Dt"] == "int16":
+            val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                              data_type=conn.DATATYPE.INT16,word_order=this_mdc["word_order"])
+          elif this_var["Dt"] == "uint8":
+            val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                              data_type=conn.DATATYPE.UINT16,word_order=this_mdc["word_order"])
+          elif this_var["Dt"] == "int8":
+            val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                              data_type=conn.DATATYPE.INT16,word_order=this_mdc["word_order"])
+          elif this_var["Dt"] == "float16":
+            val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                              data_type=conn.DATATYPE.FLOAT16,word_order=this_mdc["word_order"])
+          elif this_var["Dt"] == "float32":
+            val = conn.convert_from_registers(result.registers[this_var["memory_block_offset"]:this_var["memory_block_offset"]+dl[this_var["Dt"]]],
+                                              data_type=conn.DATATYPE.FLOAT32,word_order=this_mdc["word_order"])
+          elif this_var["Dt"] == "bool":
+            val = result.bits[this_var["memory_block_offset"]]
+        except:
+          print(f'WARNING type conversion from modbus data failed for {var}!')
+          checkstr += ' type conversion from modbus data failed for {var}'
+          checkres = 2
+          this_var["Val"] = None
+          continue
+        if not isinstance(val, numbers.Number):
+          print(f'WARNING {var} is not a number! It has type {type(val)}. The content is {val}.')
+          checkstr += ' {var} is not a number! It has type {type(val)}. The content is {val}. '
+          checkres = 2
+          this_var["Val"] = None
+          continue
+
         if this_var["Dt"].startswith("uint") and this_var["BitNum"] != None:
           val = ( val & ( 1 << this_var["BitNum"] ) ) >> this_var["BitNum"]
         if this_var["Decs"] != 0:
@@ -292,8 +323,7 @@ def read_data(this_md, checkres, checkstr):
         this_var["Val"] = val
         if debug:
           print(f'  {var} {val}')
-  if conn != None:
-    conn.close()
+  mb_close(conn,lock_pointer)
   return(checkres, checkstr)
 
 # The main loop
@@ -367,14 +397,11 @@ def modbus_logger():
           print(e)
           print(f'JSON parse error in [{section_type} {section_name}], key {key}. Bye.')
           sys.exit(1)
-
-  # Set up modbus connections
-  for this_mc_name,this_mc in mc.items():
-    this_mc["parity"]   = this_mc.get("parity","N")
-    this_mc["stopbits"] = this_mc.get("stopbits",1)
-    this_mc["bytesize"] = this_mc.get("bytesize",8)
-    this_mc["baudrate"] = this_mc.get("baudrate",38400)
-    this_mc["port"]     = this_mc.get("port",502)
+      mc[section_name]["parity"]   = mc[section_name].get("parity","N")
+      mc[section_name]["stopbits"] = mc[section_name].get("stopbits",1)
+      mc[section_name]["bytesize"] = mc[section_name].get("bytesize",8)
+      mc[section_name]["baudrate"] = mc[section_name].get("baudrate",38400)
+      mc[section_name]["port"]     = mc[section_name].get("port",502)
 
   # Start influxdb clients
   for this_ic_name,this_ic in ic.items():
@@ -401,39 +428,49 @@ def modbus_logger():
   if len(sys.argv) >= 2:
     if args.device and args.variable and args.value:
       if args.device in md:
-        if "vars" in md[args.device]:
-          if args.variable in md[args.device]["vars"]:
-            lock_pointer = acquire_lock("modbus_logger")
-            if not lock_pointer:
+        this_md = md[args.device]
+        this_mdc = md[args.device]["mdc"]
+        if args.variable in this_mdc["vars"]:
+          this_var = this_mdc["vars"][args.variable]
+          if this_var["Typ"] == 3:
+            (conn,lock_pointer) = mb_connect(this_md)
+            if lock_pointer == None:
               print('Could not acquire lock.')
               sys.exit(1)
-            if md[args.device]["vars"][args.variable]["Typ"] == 3:
-              if "Mult" in md[args.device]["vars"][args.variable]:
-                set_value=float(args.value)/md[args.device]["vars"][args.variable]["Mult"]
-                set_value=int(set_value)
-              mbargs = {
-                        "address":  md[args.device]["vars"][args.variable]["Addr"],
-                        "value":    set_value
-                       }
-              if "slaveid" in md[args.device]:
-                mbargs["device_id"]=md[args.device]["slaveid"]
-              print("Writing with argument")
-              print(mbargs)
-              md[args.device]["conn"].write_register(**mbargs) 
-              md[args.device]["conn"].close()
-            else:
-              print(f'Known variable {args.variable} for known device {args.device} is not of type 3!')
-              sys.exit(1)
-            try:
-              os.close(lock_pointer)
-            except:
-              print('Failed to close lock pointer.')
-              sys.exit(1)
+            set_value=float(args.value)/this_var["Mult"]
+            set_value=int(set_value)
+            if   this_var["Dt"] == "uint32":
+              valarr = conn.convert_to_registers(set_value,data_type=conn.DATATYPE.UINT32,word_order=this_mdc["word_order"])
+            elif this_var["Dt"] == "int32":
+              valarr = conn.convert_to_registers(set_value,data_type=conn.DATATYPE.INT32,word_order=this_mdc["word_order"])
+            elif this_var["Dt"] == "uint16":
+              valarr = conn.convert_to_registers(set_value,data_type=conn.DATATYPE.UINT16,word_order=this_mdc["word_order"])
+            elif this_var["Dt"] == "int16":
+              valarr = conn.convert_to_registers(set_value,data_type=conn.DATATYPE.INT16,word_order=this_mdc["word_order"])
+            elif this_var["Dt"] == "uint8":
+              valarr = conn.convert_to_registers(set_value,data_type=conn.DATATYPE.UINT16,word_order=this_mdc["word_order"])
+            elif this_var["Dt"] == "int8":
+              valarr = conn.convert_to_registers(set_value,data_type=conn.DATATYPE.INT16,word_order=this_mdc["word_order"])
+            elif this_var["Dt"] == "float16":
+              valarr = conn.convert_tp_registers(set_value,data_type=conn.DATATYPE.FLOAT16,word_order=this_mdc["word_order"])
+            elif this_var["Dt"] == "float32":
+              valarr = conn.convert_to_registers(set_value,data_type=conn.DATATYPE.FLOAT32,word_order=this_mdc["word_order"])
+            mbargs = {
+                      "address":              this_var["Addr"],
+                      "value":                set_value,
+                      "no_response_expected": True
+                     }
+            if "slaveid" in md[args.device]:
+              mbargs["slave"]=md[args.device]["slaveid"]
+            print("Writing with argument")
+            print(mbargs)
+            conn.write_register(**mbargs) 
+            mb_close(conn,lock_pointer)
           else:
-            print(f'Unknown variable {args.variable} for known device {args.device}')
+            print(f'Known variable {args.variable} for known device {args.device} is not of type 3!')
             sys.exit(1)
         else:
-          print(f'Known device {args.device} has no variables we can set.')
+          print(f'Unknown variable {args.variable} for known device {args.device}')
           sys.exit(1)
       else:
         print(f'Unknown device {args.device}')
@@ -495,29 +532,21 @@ def modbus_logger():
         with open(tablefilename,'w') as f:
           f.write("time".ljust(40))
           for var,vardat in mdrundat["mdc"]["vars"].items():
-            f.write(var.ljust(max(len(var),15)+1))
+            f.write((var + " ").rjust(max(len(var),15)+1))
           f.write('\n')
 
       # This is the actual modbus data transfer
-      lock_pointer = acquire_lock("modbus_logger_dev")
-      if not lock_pointer:
-        print('Could not acquire lock.')
-        continue
       if debug:
         print('')
         print(f'+++++++ READING {mdrun}')
       (checkres, checkstr) = read_data(mdrundat, checkres, checkstr)
-      try:
-        os.close(lock_pointer)
-      except Exception as e:
-        print(e)
-        print('Lock pointer failed to close.')
- 
+
       # Loop over results
+      found_data_error = False
       with open(tablefilename,'a') as f:
         outstr=str(now).ljust(40)
         for (var,vardat) in mdrundat["mdc"]["vars"].items():
-          # ( meas_tmp, decs_tmp, checkres, checkstr ) = get_value(mdrundat, var, checkres, checkstr)
+          maxoutlen = max(len(var),15)+1
           if vardat["Val"] != None:
             meas[var] = vardat["Val"]
             decs[var] = vardat["Decs"]
@@ -527,15 +556,31 @@ def modbus_logger():
               else:
                 print(f'{var: <18} = {meas[var]:6.{decs[var]}f} {vardat["Unit"]: <4} ({vardat["Comment"]})')
             # Output to table file
-            outstr += (str(meas[var]) + " " + vardat["Unit"]).ljust(max(len(var),15)+1)
+            if vardat["Unit"] != "":
+              outsuf = " " + vardat["Unit"] + " "
+            else:
+              outsuf = " "
+            maxvarlen = maxoutlen - len(outsuf)
+            # Does the data come from a modbus int or bool?
+            if not vardat["Dt"].startswith("float"):
+              outvar = format(vardat["Val"],f'{maxvarlen}.{vardat["Decs"]}f')
+            # Does the data come from a modbus float?
+            else:
+              outvar = str(vardat["Val"])
+              if len(outvar) > maxvarlen:
+                outvar=outvar[:maxvarlen]
+            # Does the data come from a modbus bool?
+            #  outstr = format(str(vardat["Val"]),f'{maxvarlen}')
+            outstr += (outvar + outsuf).rjust(maxoutlen)
           else:
-            outstr += "ERROR".ljust(max(len(var),15)+1)
+            outstr += "ERROR".ljust(maxoutlen)
+            found_data_error = True
   
         f.write(f'{outstr}\n')
 
       # If data is available and we are not in debug mode, write it to influxdb
       if not debug:
-        if "influxdb" in mdrundat:
+        if "influxdb" in mdrundat and not found_data_error:
           if meas and checkres != 3:
             series = [
               {
