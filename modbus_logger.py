@@ -504,6 +504,9 @@ def modbus_logger():
     # When did the previous round start?
     laststart=datetime.datetime.now(datetime.UTC)
 
+    for this_ic_name,this_ic in ic.items():
+      this_ic["series"] = []
+
     for mdrun,mdrundat in md.items():
 
       # When did we start?
@@ -541,10 +544,10 @@ def modbus_logger():
         print(f'+++++++ READING {mdrun}')
       (checkres, checkstr) = read_data(mdrundat, checkres, checkstr)
 
-      # Loop over results
       found_data_error = False
       with open(tablefilename,'a') as f:
         outstr=str(now).ljust(40)
+        # Loop over results
         for (var,vardat) in mdrundat["mdc"]["vars"].items():
           maxoutlen = max(len(var),15)+1
           if vardat["Val"] != None:
@@ -578,27 +581,15 @@ def modbus_logger():
   
         f.write(f'{outstr}\n')
 
-      # If data is available and we are not in debug mode, write it to influxdb
-      if not debug:
-        if "influxdb" in mdrundat and not found_data_error:
-          if meas and checkres != 3:
-            series = [
-              {
-                "measurement": mdrun,
-                "tags":        {},
-                "time":        datatime,
-                "fields":      meas
-              }
-            ]
-            try:
-              mdrundat["ic"]["cono"].write_points(series)
-            except Exception as e:
-              print(e)
-              print('Could not write to InfluxDB')
-          else:
-            print('Not writing to InfluxDB. Either no data or data invalid.')
-      else:
-        print('Debug mode. Not attempting influxdb write.')
+      if "influxdb" in mdrundat and not found_data_error and meas and checkres != 3:
+        mdrundat["ic"]["series"].append(
+                {
+                  "measurement": mdrun,
+                  "tags":        {},
+                  "time":        datatime,
+                  "fields":      meas
+                }
+              )
 
       # Write nagios status file to disk 
       try:
@@ -623,6 +614,18 @@ def modbus_logger():
         print(e)
 
       time.sleep(1)
+
+    # If data is available and we are not in debug mode, write it to influxdb
+    if not debug:
+      for this_ic_name,this_ic in ic.items():
+        if len(this_ic["series"]) > 0:
+          try:
+            this_ic["cono"].write_points(this_ic["series"])
+          except Exception as e:
+            print(e)
+            print(f'Could not write to InfluxDB {this_ic_name}')
+    else:
+      print('Debug mode. Not attempting influxdb write.')
 
 if __name__ == "__main__":
   modbus_logger()
